@@ -269,6 +269,21 @@ Files: `/tmp/roll1-fix-f0{2,4}.tiff`. Scanned `--resolution 4000 --depth 14
 - ✅ **Drift fix verified** on the LS-50 ED (Roll 1 post-fix: −43 → +2 px/frame).
 - ✅ **Tunable options implemented & verified:** `--frame-offset` (default `boundaryy`)
   and `--frame-base-offset` (default 0); base offset confirmed end-to-end.
+- ⚠️ **`--frame-base-offset` (and `--subframe`) cannot shift down past the frame end
+  (2026-06-15, hardware-verified).** A 6 mm down-shift produced a flat constant-fill band
+  (value ~66.6) over the bottom ~14% (frames 4 & 6). **Not a bug in this work:** `--subframe
+  6.0` reproduces the *identical* artifact (same start row, same value), and `subframe`
+  predates these changes. Root cause: the scanner only delivers data up to a fixed per-frame
+  limit ≈ `frame_origin + boundaryy` (measured abs Y ≈ 23952 units / 152 mm for frame 4);
+  any window shifted past it gets filler for the overrun. This limit is **not** moved by
+  `subframe`, `frame_base`, or the boundary table (`cs3_set_boundary`) — a speculative
+  change adding `frame_base` there had zero effect and was reverted.
+  - The un-shifted (`base 0`) scan already captures the **full frame**; the ~6 mm gap is
+    real clear-film-base sitting inside the window, not lost data.
+  - **Correct way to remove the top gap: crop with `--tl-y` (not a down-shift).** Verified:
+    `--frame 4 --tl-y 1100` (≈7 mm at full-res device units) removes the gap with **no fill
+    band** (br-y auto-clamps to boundaryy-1, keeping the window inside the deliverable
+    limit). `--frame-base-offset` remains useful only for *small* nudges, like `subframe`.
 - ⏳ Is the constant offset (~6.0 mm) **stable across rolls/holders**, or does it vary with
   how the strip is inserted? Next: scan ≥2 more rolls, log in §5. If stable, consider
   baking ~6.0 mm in as the SA-21 default; if it varies, leave it user-set.
