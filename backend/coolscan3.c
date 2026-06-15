@@ -115,6 +115,13 @@ cs3_infrared_t;
 
 typedef enum
 {
+	CS3_ADAPTER_SA21 = 0,	/* SA-21 strip feeder: pitch = boundaryy */
+	CS3_ADAPTER_SA20	/* SA-20 strip feeder (LS-30): pitch = resy_max*1.5+1 */
+}
+cs3_adapter_t;
+
+typedef enum
+{
 	CS3_OPTION_NUM = 0,
 
 	CS3_OPTION_PREVIEW,
@@ -148,7 +155,7 @@ typedef enum
 	CS3_OPTION_FRAME,
 	CS3_OPTION_FRAME_COUNT,
 	CS3_OPTION_SUBFRAME,
-	CS3_OPTION_FRAME_OFFSET,
+	CS3_OPTION_ADAPTER,
 	CS3_OPTION_FRAME_BASE,
 	CS3_OPTION_XMIN,
 	CS3_OPTION_XMAX,
@@ -241,6 +248,7 @@ typedef struct
 	int i_frame, frame_count;
 	double subframe;
 	double frame_base;	/* per-holder base Y offset, mm */
+	cs3_adapter_t adapter;	/* strip feeder type -> frame pitch */
 
 	unsigned int real_resx, real_resy, real_pitchx, real_pitchy;
 	unsigned long real_xoffset, real_yoffset, real_width, real_height,
@@ -316,6 +324,9 @@ static void cs3_xfree(void *p);
 /* global variables */
 
 static int cs3_colors[] = { 1, 2, 3, 9 };
+
+/* index order must match cs3_adapter_t */
+static SANE_String_Const cs3_adapter_list[] = { "sa21", "sa20", NULL };
 
 static SANE_Device **device_list = NULL;
 static int n_device_list = 0;
@@ -841,28 +852,21 @@ sane_open(SANE_String_Const name, SANE_Handle * h)
 				o.constraint.range = range;
 			}
 			break;
-		case CS3_OPTION_FRAME_OFFSET:
-			o.name = "frame-offset";
-			o.title = "Frame offset";
-			o.desc = "Distance between consecutive frames in the strip holder (default: holder window height)";
-			o.type = SANE_TYPE_FIXED;
-			o.unit = SANE_UNIT_MM;
-			o.size = WSIZE;
+		case CS3_OPTION_ADAPTER:
+			o.name = "adapter";
+			o.title = "Film strip adapter";
+			o.desc = "Strip feeder type, sets the frame pitch: "
+				"sa21 (default) uses the holder window height; "
+				"sa20 uses the LS-30 pitch (resy_max*1.5+1)";
+			o.type = SANE_TYPE_STRING;
+			o.unit = SANE_UNIT_NONE;
+			o.size = 5;	/* "sa21"/"sa20" + NUL */
 			o.cap = SANE_CAP_SOFT_SELECT | SANE_CAP_SOFT_DETECT
 				| SANE_CAP_ADVANCED;
 			if (s->n_frames <= 1)
 				o.cap |= SANE_CAP_INACTIVE;
-			o.constraint_type = SANE_CONSTRAINT_RANGE;
-			range = (SANE_Range *) cs3_xmalloc(sizeof(SANE_Range));
-			if (!range)
-				alloc_failed = 1;
-			else {
-				range->min = SANE_FIX(0.);
-				range->max =
-					SANE_FIX(2. * s->boundaryy * s->unit_mm);
-				range->quant = SANE_FIX(0.);
-				o.constraint.range = range;
-			}
+			o.constraint_type = SANE_CONSTRAINT_STRING_LIST;
+			o.constraint.string_list = cs3_adapter_list;
 			break;
 		case CS3_OPTION_FRAME_BASE:
 			o.name = "frame-base-offset";
@@ -1088,7 +1092,13 @@ sane_open(SANE_String_Const name, SANE_Handle * h)
 	s->frame_count = 1;
 	s->subframe = 0.;
 	s->frame_base = 0.;
-	/* s->frame_offset defaulted to boundaryy in cs3_full_inquiry() */
+	/* LS-30 / LS-2000 ship with the SA-20 strip feeder; everything else
+	   uses the SA-21.  frame_offset is derived from this in
+	   cs3_convert_options(); the user can still override via --adapter. */
+	if ((s->type == CS3_TYPE_LS30) || (s->type == CS3_TYPE_LS2000))
+		s->adapter = CS3_ADAPTER_SA20;
+	else
+		s->adapter = CS3_ADAPTER_SA21;
 	s->res = s->resx = s->resx_max;
 	s->resy = s->resy_max;
 	s->res_independent = SANE_FALSE;
@@ -1223,8 +1233,8 @@ sane_control_option(SANE_Handle h, SANE_Int n, SANE_Action a, void *v,
 		case CS3_OPTION_SUBFRAME:
 			*(SANE_Word *) v = SANE_FIX(s->subframe);
 			break;
-		case CS3_OPTION_FRAME_OFFSET:
-			*(SANE_Word *) v = SANE_FIX(s->frame_offset * s->unit_mm);
+		case CS3_OPTION_ADAPTER:
+			strcpy((SANE_String) v, cs3_adapter_list[s->adapter]);
 			break;
 		case CS3_OPTION_FRAME_BASE:
 			*(SANE_Word *) v = SANE_FIX(s->frame_base);
@@ -1405,10 +1415,11 @@ sane_control_option(SANE_Handle h, SANE_Int n, SANE_Action a, void *v,
 		case CS3_OPTION_SUBFRAME:
 			s->subframe = SANE_UNFIX(*(SANE_Word *) v);
 			break;
-		case CS3_OPTION_FRAME_OFFSET:
-			s->frame_offset =
-				(unsigned long) (SANE_UNFIX(*(SANE_Word *) v) /
-						 s->unit_mm + 0.5);
+		case CS3_OPTION_ADAPTER:
+			if (!strcmp((SANE_String) v, "sa20"))
+				s->adapter = CS3_ADAPTER_SA20;
+			else
+				s->adapter = CS3_ADAPTER_SA21;
 			flags |= SANE_INFO_RELOAD_PARAMS;
 			break;
 		case CS3_OPTION_FRAME_BASE:
@@ -2627,17 +2638,11 @@ cs3_full_inquiry(cs3_t * s)
 
 	s->n_frames = s->recv_buf[75];
 
-	/* Per-frame advance for the strip holder.
-	   The old heuristic (resy_max * 1.5 + 1 ~= 38.11 mm) was validated only
-	   for the LS-30 (SA-20 feeder), so keep it there to avoid a regression.
-	   For other models (e.g. LS-50/LS-5000 with the SA-21 it over-advances
-	   and drifts cumulatively) the true pitch equals the holder window
-	   height (boundaryy).  Either way the user can override via the
-	   "frame-offset" option. */
-	if (s->type == CS3_TYPE_LS30)
-		s->frame_offset = s->resy_max * 1.5 + 1;
-	else
-		s->frame_offset = s->boundaryy;
+	/* Baseline per-frame advance; the authoritative value is derived from
+	   the "adapter" option in cs3_convert_options().  SA-21 (default) uses
+	   the holder window height (boundaryy); SA-20 (LS-30) uses the old
+	   resy_max*1.5+1 heuristic. */
+	s->frame_offset = s->boundaryy;
 
 	/* generate resolution list for x */
 	s->resx_n_list = pitch_max =
@@ -2930,6 +2935,12 @@ cs3_convert_options(cs3_t * s)
 	unsigned long xmin, xmax, ymin, ymax;
 
 	DBG(4, "%s\n", __func__);
+
+	/* frame pitch is set by the strip adapter */
+	if (s->adapter == CS3_ADAPTER_SA20)
+		s->frame_offset = s->resy_max * 1.5 + 1;
+	else
+		s->frame_offset = s->boundaryy;
 
 	s->real_depth = (s->preview ? 8 : s->depth);
 	s->bytes_per_pixel = (s->real_depth > 8 ? 2 : 1);

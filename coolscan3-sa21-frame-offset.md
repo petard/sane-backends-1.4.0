@@ -93,43 +93,47 @@ Solving with the two measured points:
 **(a) Drift** — default per-frame advance now model-conditional (`coolscan3.c`,
 `cs3_full_inquiry`):
 
+The per-frame pitch is selected by the `--adapter` option (in `cs3_convert_options`):
+
 ```c
-if (s->type == CS3_TYPE_LS30)
-    s->frame_offset = s->resy_max * 1.5 + 1;  /* validated for LS-30 / SA-20 feeder */
+if (s->adapter == CS3_ADAPTER_SA20)
+    s->frame_offset = s->resy_max * 1.5 + 1;  /* LS-30 / SA-20 feeder, ~38.11 mm */
 else
-    s->frame_offset = s->boundaryy;           /* SA-21 etc.: true pitch = holder window */
+    s->frame_offset = s->boundaryy;           /* SA-21 (default): pitch = holder window */
 ```
 
 The old `resy_max*1.5+1` heuristic always targets ~38.11 mm (since `1.5×25.4=38.1` when
-`resx_max==resy_max`). It was only ever *validated for the LS-30*, so that path is kept to
-avoid regressing it (the LS-30 uses the SA-20 feeder, different holder geometry, and we
-have no LS-30 `boundaryy` to confirm). All other models default to `boundaryy`
-(measured-correct on the LS-50 ED). `--frame-offset` overrides either way.
+`resx_max==resy_max`) and was only ever *validated for the LS-30*. It is selected by
+`--adapter sa20`; `sa21` uses `boundaryy` (measured-correct on the LS-50 ED).
 
-> LS-2000 (also 2700 dpi, older) is untested under both old and new defaults — revisit if
-> a user reports drift there.
+> **Default adapter is model-aware:** LS-30 and LS-2000 (the models shipping with the
+> SA-20 feeder) default to `sa20`; all other models default to `sa21`. The user can
+> override either way with `--adapter`. (The LS-30/LS-2000 default is untested on
+> hardware — verified only that the LS-50 ED stays on `sa21`.)
 
-**(b) Two new tunable options** (both mm, advanced, active only when frames > 1):
+**(b) Options:**
 
-| option | controls | default | notes |
+| option | values / unit | default | notes |
 |---|---|---|---|
-| `--frame-offset` | per-frame advance (pitch) | `boundaryy` × unit_mm (≈37.84 mm) | fixes/tunes the **drift** |
-| `--frame-base-offset` | constant Y shift of the holder origin | 0 mm | fixes the **constant** offset; ≈6.1 mm for this roll |
+| `--adapter` | `sa21` \| `sa20` | `sa21` | selects frame pitch (SA-21 holder vs LS-30 SA-20) |
+| `--frame-base-offset` | mm | 0 | constant Y shift of holder origin; small nudges only (see §6 down-shift limit) |
 
-Geometry now (`cs3_convert_options`):
+(The earlier `--frame-offset` mm option was removed in favour of `--adapter`.)
+
+Geometry (`cs3_convert_options`):
 
 ```c
 real_yoffset = ymin + frame_base/unit_mm + (i_frame-1)*frame_offset + subframe/unit_mm;
 ```
 
-`frame-base-offset` and `subframe` both add a constant shift; use `frame-base-offset`
-for the fixed per-holder origin and keep `subframe` for fine per-scan nudges.
+`frame-base-offset` and `subframe` both add a constant shift; keep both small.
 
-Example (per-frame, IR, full res):
+Example (per-frame, IR, full res) — `--adapter` defaults to sa21 so it can be omitted on
+the LS-50; crop the top gap with `--tl-y` (see §6):
 
 ```bash
 DEV='coolscan3:usb:libusb:000:001'
-scanimage -d "$DEV" --frame 4 --frame-offset 37.84 --frame-base-offset 6.0 \
+scanimage -d "$DEV" --frame 4 --tl-y 1100 \
           --resolution 4000 --depth 14 --infrared=yes --format=tiff > out.tiff
 ```
 
@@ -267,8 +271,9 @@ Files: `/tmp/roll1-fix-f0{2,4}.tiff`. Scanned `--resolution 4000 --depth 14
 ## 6. Status / open questions
 
 - ✅ **Drift fix verified** on the LS-50 ED (Roll 1 post-fix: −43 → +2 px/frame).
-- ✅ **Tunable options implemented & verified:** `--frame-offset` (default `boundaryy`)
-  and `--frame-base-offset` (default 0); base offset confirmed end-to-end.
+- ✅ **Options implemented & verified:** `--adapter` (`sa21` default = boundaryy /
+  `sa20` = LS-30 pitch; verified frame-2 yoffset 5959 vs 6001) and `--frame-base-offset`.
+  The earlier `--frame-offset` mm option was removed in favour of `--adapter`.
 - ⚠️ **`--frame-base-offset` (and `--subframe`) cannot shift down past the frame end
   (2026-06-15, hardware-verified).** A 6 mm down-shift produced a flat constant-fill band
   (value ~66.6) over the bottom ~14% (frames 4 & 6). **Not a bug in this work:** `--subframe
