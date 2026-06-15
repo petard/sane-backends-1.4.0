@@ -21,10 +21,16 @@
 #   surroundings.  We estimate the local background with a median filter and
 #   look at how far each pixel falls below it (the "defect map").
 #
-#   The threshold is ADAPTIVE: it is set per-image from the defect map's own
-#   statistics (mean + k*sigma), so it self-tunes to each scan's grain level
-#   and IR contrast instead of relying on a hand-picked absolute value.  This
-#   also makes it depth-agnostic (works for 8- and 16-bit alike).
+#   The threshold is ADAPTIVE and ROBUST: it is set per-image as
+#   median + k*sigma, where sigma is estimated from the Median Absolute
+#   Deviation (sigma = 1.4826*MAD) of the defect map.  Using median/MAD rather
+#   than mean/std means the estimate is NOT inflated by the sparse, very-high-
+#   contrast outliers (the defects themselves, plus frame borders and strong
+#   image edges in the IR).  A plain mean+std threshold over a whole frame gets
+#   pulled high by those borders and then either misses faint dust or, when
+#   loosened, floods the mask with film grain; the MAD estimate tracks the true
+#   grain-noise level, so the same k behaves consistently across whole frames,
+#   crops, films and grain levels.  It is also depth-agnostic (8- or 16-bit).
 #
 #   Two passes are unioned so both defect shapes are handled while film grain
 #   is rejected by SHAPE (grain = tiny isolated specks; hairs = long lines):
@@ -38,12 +44,13 @@
 #   IR_MEDIAN        background-estimate median radius (px). Must exceed the
 #                    half-width of the defects you want to catch.        [5]
 #   IR_BLUR          pre-denoise blur sigma on the IR channel.          [0.6]
-#   IR_DUST_SENS     dust threshold in sigmas above the noise. Lower=more. [3]
-#   IR_DUST_MINAREA  drop dust components smaller than this (px).         [3]
-#   IR_DUST_DILATE   grow dust mask by this radius (px).                  [2]
-#   IR_LINE_SENS     line/scratch threshold in sigmas. Lower=more.      [1.5]
+#   IR_DUST_SENS     dust threshold in robust sigmas above noise. Lower=more.[4]
+#   IR_DUST_MINAREA  drop dust components smaller than this (px) -- this is
+#                    what rejects film grain (grain clumps are small).    [8]
+#   IR_DUST_DILATE   grow dust mask by this radius (px).                   [2]
+#   IR_LINE_SENS     line/scratch threshold in robust sigmas. Lower=more.[1.5]
 #   IR_LINE_MINAREA  min connected-component size to count as a line (px).[40]
-#   IR_LINE_DILATE   grow line mask by this radius -- covers hair width. [5]
+#   IR_LINE_DILATE   grow line mask by this radius -- covers hair width.  [5]
 #   IR_INPAINT       fast (default) | patch  (see below)
 #   SAVE_MASK        if 1, also write the mask next to OUT (*.mask.tif). [unset]
 #
@@ -72,8 +79,8 @@ command -v gmic >/dev/null 2>&1 || die "gmic not found -- install it: brew insta
 # --- tunables ---------------------------------------------------------------
 IR_MEDIAN=${IR_MEDIAN:-5}
 IR_BLUR=${IR_BLUR:-0.6}
-IR_DUST_SENS=${IR_DUST_SENS:-3}
-IR_DUST_MINAREA=${IR_DUST_MINAREA:-3}
+IR_DUST_SENS=${IR_DUST_SENS:-4}
+IR_DUST_MINAREA=${IR_DUST_MINAREA:-8}
 IR_DUST_DILATE=${IR_DUST_DILATE:-2}
 IR_LINE_SENS=${IR_LINE_SENS:-1.5}
 IR_LINE_MINAREA=${IR_LINE_MINAREA:-40}
@@ -93,9 +100,29 @@ if command -v identify >/dev/null 2>&1; then
 	[ "$depth" = "8" ] && OTYPE=uint8
 fi
 
+# --- pass 1: robust noise estimate (median + MAD) of the defect map ---------
+# Build the defect map (median-background(IR) - IR) and read its median and its
+# MAD via G'MIC's 'ic' (median) stat.  sigma = 1.4826*MAD matches a Gaussian's
+# std but is immune to the sparse high-contrast outliers.  Absolute thresholds
+# (median + k*sigma) are then derived in the shell and handed to pass 2.
+stats=$(gmic \
+	-input "$IR" -channels[0] 0 -blur[0] "$IR_BLUR" \
+	+median[0] "$IR_MEDIAN" -sub[1] [0] -keep[1] \
+	+fill[0] 'abs(i-ic)' \
+	-echo 'CS3STAT_{-2,ic}_{-1,ic}' 2>&1 \
+	| grep -oE 'CS3STAT_[-0-9.eE+]+_[-0-9.eE+]+' | head -1)
+[ -n "$stats" ] || die "could not compute robust IR statistics via gmic"
+MED=${stats#CS3STAT_}; MED=${MED%_*}
+MAD=${stats##*_}
+# sigma from MAD, with a floor so a degenerate (flat) IR can't flag everything
+SIGMA=$(awk -v m="$MAD" 'BEGIN{s=1.4826*m; if(s<=0)s=1; print s}')
+DUST_THR=$(awk -v c="$MED" -v s="$SIGMA" -v k="$IR_DUST_SENS" 'BEGIN{print c+k*s}')
+LINE_THR=$(awk -v c="$MED" -v s="$SIGMA" -v k="$IR_LINE_SENS" 'BEGIN{print c+k*s}')
+
 echo ">> RGB=$RGB  IR=$IR  ->  OUT=$OUT  (${OTYPE})"
-echo ">> dust: sens=${IR_DUST_SENS}sigma minarea=$IR_DUST_MINAREA dilate=$IR_DUST_DILATE"
-echo ">> line: sens=${IR_LINE_SENS}sigma minarea=$IR_LINE_MINAREA dilate=$IR_LINE_DILATE"
+echo ">> robust noise: median=$MED  MAD=$MAD  sigma=$SIGMA"
+echo ">> dust: ${IR_DUST_SENS}sigma thr=$DUST_THR minarea=$IR_DUST_MINAREA dilate=$IR_DUST_DILATE"
+echo ">> line: ${IR_LINE_SENS}sigma thr=$LINE_THR minarea=$IR_LINE_MINAREA dilate=$IR_LINE_DILATE"
 if [ "$IR_INPAINT" = "patch" ]; then
 	echo ">> inpaint: PATCH (slow) patch=$GMIC_PATCH lookup=$GMIC_LOOKUP blend=$GMIC_BLEND scales=$GMIC_BLEND_SCALES"
 else
@@ -109,9 +136,8 @@ fi
 #   [base] : defect map = local-background(IR) - IR  (large where defects are)
 #   [mask] : 0/255 defect mask -- nonzero = "inpaint here"
 #
-# The adaptive threshold lives inside a fill expression: 'i' is the pixel,
-# 'ia'/'iv' are the image average/variance, so 'i > ia + k*sqrt(iv)' flags
-# pixels k sigma above the noise -- no hand-tuned absolute value needed.
+# DUST_THR / LINE_THR are the absolute median+k*sigma thresholds computed from
+# the robust noise estimate in pass 1, so the fill is a plain 'i > thr'.
 cmd=(gmic
 	-input "$RGB"             -name[-1] rgb
 	-input "$IR"              -name[-1] ir
@@ -120,12 +146,12 @@ cmd=(gmic
 	+median[ir] "$IR_MEDIAN"  -name[-1] base
 	-sub[base] [ir]
 	# DUST pass: sensitive threshold, drop tiny grain, light dilation
-	+fill[base] "i>ia+${IR_DUST_SENS}*sqrt(iv)?1:0" -name[-1] dust
+	+fill[base] "i>$DUST_THR?1:0" -name[-1] dust
 	-area_fg[dust] 0
 	-threshold[dust] "$IR_DUST_MINAREA"
 	-dilate_circ[dust] "$IR_DUST_DILATE"
 	# LINE pass: lower threshold, keep only large connected components, dilate wide
-	+fill[base] "i>ia+${IR_LINE_SENS}*sqrt(iv)?1:0" -name[-1] line
+	+fill[base] "i>$LINE_THR?1:0" -name[-1] line
 	-area_fg[line] 0
 	-threshold[line] "$IR_LINE_MINAREA"
 	-dilate_circ[line] "$IR_LINE_DILATE"
