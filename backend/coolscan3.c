@@ -365,6 +365,7 @@ sane_exit(void)
 		cs3_xfree((void *)device_list[i]->name);
 		cs3_xfree((void *)device_list[i]->vendor);
 		cs3_xfree((void *)device_list[i]->model);
+		cs3_xfree((void *)device_list[i]->type);
 		cs3_xfree(device_list[i]);
 	}
 	cs3_xfree(device_list);
@@ -2115,7 +2116,47 @@ cs3_open(const char *device, cs3_interface_t interface, cs3_t ** sp)
 			device_list[n_device_list]->model = line;
 		}
 
-		device_list[n_device_list]->type = "film scanner";
+		{
+			/* Report the mounted adapter and film status via the
+			   device "type" string (shown by `scanimage -L`).  Read
+			   vendor page 0xc1: byte 74 = adapter frame capacity
+			   (1 = MA-21 slide mount, 6 = SA-21 strip, other =
+			   N-frame strip), byte 75 = frames currently loaded.
+			   NOTE: for the MA-21 byte 75 is always 1 and does NOT
+			   reflect slide presence, so no load state is reported
+			   for the slide adapter. */
+			char tbuf[80];
+			int cap = 0, loaded = 0;
+
+			if ((cs3_page_inquiry(s, 0xc1) == SANE_STATUS_GOOD)
+			    && (s->n_recv > 75)) {
+				cap = s->recv_buf[74];
+				loaded = s->recv_buf[75];
+			}
+			if (cap == 1)
+				snprintf(tbuf, sizeof(tbuf),
+					 "film scanner, MA-21 slide adapter");
+			else if (cap > 1) {
+				char nm[40];
+				if (cap == 6)
+					snprintf(nm, sizeof(nm),
+						 "SA-21 strip adapter");
+				else
+					snprintf(nm, sizeof(nm),
+						 "%d-frame strip adapter", cap);
+				snprintf(tbuf, sizeof(tbuf), "film scanner, %s, %s",
+					 nm, loaded ? "film loaded" : "no film");
+			} else
+				snprintf(tbuf, sizeof(tbuf), "film scanner");
+
+			line = (char *) cs3_xmalloc(strlen(tbuf) + 1);
+			if (!line)
+				alloc_failed = 1;
+			else {
+				strcpy(line, tbuf);
+				device_list[n_device_list]->type = line;
+			}
+		}
 
 		if (alloc_failed) {
 			cs3_xfree((void *)device_list[n_device_list]->name);

@@ -294,3 +294,68 @@ Files: `/tmp/roll1-fix-f0{2,4}.tiff`. Scanned `--resolution 4000 --depth 14
   baking ~6.0 mm in as the SA-21 default; if it varies, leave it user-set.
 - ⏳ Verify the same correction on other SA-21-capable models (LS-40 / LS-IV ED).
 - ⏳ LS-30 path kept on the old `resy_max*1.5+1` formula (unverified — no hardware).
+
+---
+
+## 7. Adapter detection — INQUIRY vendor page 0xc1 (2026-06-15)
+
+The backend reads a SCSI INQUIRY **vendor page `0xc1`** (`cs3_page_inquiry(s, 0xc1)`).
+Its length is self-describing (`n = recv_buf[3] + 4`; 87 bytes on the LS-50 ED). Most
+capabilities come from fixed offsets here (resolutions, `boundaryx/y`, focus, depth).
+
+Originally the only holder signal used was `n_frames = recv_buf[75]`. Dumping the full
+page with an **SA-21 strip** vs an **MA-21 slide mount** inserted (both empty of film
+where noted) on the LS-50 ED revealed which bytes encode the adapter:
+
+| byte | SA-21 | MA-21 | meaning |
+|------|-------|-------|---------|
+| **74** | `0x06` | `0x01` | **adapter frame *capacity*** — independent of load state. 1 = slide mount, N = N-frame strip. **This is the adapter-type discriminator.** |
+| 75 | `0x00` | `0x01` | frames currently *loaded* (the historical `n_frames`). SA-21 was empty → 0; a loaded 6-frame strip reads 6; the slide mount always reads 1. |
+| 58–61 (`boundaryy`) | 5959 | 5782 | scannable window height differs per holder |
+| 17 | `0x31` | `0x22` | adapter-specific parameter |
+| 48–49 | `0x0000` | `0x1695` | adapter-specific Y limit |
+| 60–61 | `0x1747` | `0x1696` | (low half of boundaryy) |
+| 64–65 | `0x1747` | `0x0000` | adapter-specific Y limit |
+| 71, 73 | `0x61` | `0x00` | strip inter-frame spacing (0 for single-frame slide) |
+
+Full SA-21 dump (empty), for reference:
+```
+off  0: 06 c1 00 53 03 00 3a 00 0f 00 00 00 40 01 01 00
+off 16: 01 31 0f a0 0f a0 00 5a 00 00 00 00 00 00 00 00
+off 32: 00 00 00 00 00 00 0f 6a 0f a0 0f a0 00 5a 00 00
+off 48: 00 00 00 00 00 00 00 00 00 00 00 00 17 47 00 00
+off 64: 17 47 00 00 00 00 00 61 00 61 06 00 00 00 01 43
+off 80: 00 00 0e 0f 6a 00 01
+```
+
+### Key points
+- **Byte 74 (capacity)** distinguishes *slide vs strip* and is stable regardless of
+  whether film is loaded. **Byte 75 (loaded)** is what tells you if film/a slide is present.
+- **Byte 74 does NOT distinguish SA-20 vs SA-21** — both are 6-frame strips and read `0x06`.
+  The SA-20/SA-21 *pitch* choice therefore still relies on the model-based `--adapter`
+  default (LS-30/LS-2000 → sa20). Byte 74 solves "slide vs strip/batch", not "which strip".
+- A batch/bulk feeder (SF-200) is untested; it would presumably report its own capacity.
+- `boundaryy` itself changes with the holder (5959 strip vs 5782 slide); since
+  `frame_offset = boundaryy` (sa21), the pitch self-adjusts to the mounted holder.
+
+### `scanimage -L` reporting
+`cs3_open()` now issues the `0xc1` inquiry while building the device list and folds the
+adapter name + film status into the SANE device **`type`** string (which `-L` prints):
+
+| byte 74 (capacity) | `-L` suffix |
+|--------------------|-------------|
+| 1 (MA-21 slide) | `film scanner, MA-21 slide adapter` |
+| 6 (SA-21 strip) | `film scanner, SA-21 strip adapter, film loaded` / `…, no film` (byte 75) |
+| other >1 | `film scanner, <N>-frame strip adapter, film loaded` / `…, no film` |
+| 0 / page unavailable | `film scanner` |
+
+> **No load state for the MA-21 slide adapter:** byte 75 reads 1 whether or not a slide is
+> physically present (confirmed: two byte-identical no-slide dumps), so slide presence is
+> not detectable from page 0xc1. Film status is reported only for the strip adapter, where
+> byte 75 = loaded frame count (0 = empty). A with-slide dump (to recheck for a presence
+> bit) is a TODO once a slide is available.
+
+Verified (MA-21 inserted, no slide):
+```
+device `coolscan3:usb:libusb:001:001' is a Nikon LS-50 ED film scanner, MA-21 slide adapter
+```
