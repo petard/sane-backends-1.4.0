@@ -1576,6 +1576,16 @@ sane_start(SANE_Handle h)
 	if (status != SANE_STATUS_GOOD)
 		return status;
 
+	/* Safety valve: scanning at an effective resolution below 1000 dpi
+	   CRASHES the scanner (it hangs mid-transfer and needs a power cycle).
+	   Preview mode uses its own low-resolution path and is exempt; abort
+	   any other scan with a clear message pointing the user at --preview. */
+	if (!s->preview && ((s->real_resx < 1000) || (s->real_resy < 1000))) {
+		fprintf(stderr,
+			"Resolution lower than 1000, use --preview and --preview-resolution instead\n");
+		return SANE_STATUS_INVAL;
+	}
+
 	s->i_line_buf = 0;
 	s->infrared_index = 0;
 	s->xfer_position = 0;

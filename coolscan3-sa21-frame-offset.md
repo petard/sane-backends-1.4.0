@@ -423,3 +423,28 @@ is reverted (`cs3_send_lut` restored to sending the stored LUTs unchanged).
 - **Unresolved:** an earlier report said `negative=yes` did *not* invert. That contradicts
   this result; likely a different film/exposure/frontend at the time, or it referred to the
   residual colour cast. Not reproduced here.
+
+---
+
+## 9. Safety valve: resolutions below 1000 dpi crash the scanner (2026-06-16)
+
+Scanning at an effective resolution **< 1000 dpi crashes the scanner** — it stalls
+mid-transfer (the READ loop stops, the USB status read times out after ~30 s) and needs a
+full power cycle (off + unplug USB) to recover. Reproduced repeatedly at 300 dpi.
+
+`sane_start()` now aborts such scans **before** any hardware scan command:
+
+```c
+/* in sane_start, right after cs3_convert_options() */
+if (!s->preview && ((s->real_resx < 1000) || (s->real_resy < 1000))) {
+    fprintf(stderr,
+        "Resolution lower than 1000, use --preview and --preview-resolution instead\n");
+    return SANE_STATUS_INVAL;
+}
+```
+
+- Preview mode is **exempt** — low-resolution scanning in preview mode works fine
+  (user-confirmed), so the message directs users to `--preview` together with
+  `--preview-resolution` to set the low res there.
+- Verified: `--resolution 500` prints the message and aborts with no scan; `--resolution
+  1000` (and above) proceeds normally.
