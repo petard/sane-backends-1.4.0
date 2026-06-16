@@ -338,24 +338,88 @@ off 80: 00 00 0e 0f 6a 00 01
 - `boundaryy` itself changes with the holder (5959 strip vs 5782 slide); since
   `frame_offset = boundaryy` (sa21), the pitch self-adjusts to the mounted holder.
 
-### `scanimage -L` reporting
-`cs3_open()` now issues the `0xc1` inquiry while building the device list and folds the
-adapter name + film status into the SANE device **`type`** string (which `-L` prints):
+### Firmware adapter codes (from `coolscan-mods` disassembly)
 
-| byte 74 (capacity) | `-L` suffix |
-|--------------------|-------------|
-| 1 (MA-21 slide) | `film scanner, MA-21 slide adapter` |
-| 6 (SA-21 strip) | `film scanner, SA-21 strip adapter, film loaded` / `…, no film` (byte 75) |
-| other >1 | `film scanner, <N>-frame strip adapter, film loaded` / `…, no film` |
-| 0 / page unavailable | `film scanner` |
+The firmware reads a **3-bit Adapter ID** from GPIO PC3–PC5 (gated by PC7 "present"),
+held in mode-status RAM `0x0040`. The dispatch at `0x02A2B2` (`CMP.B #0x00…#0x07`)
+confirms the full set:
+
+| ID | adapter | ID | adapter |
+|----|---------|----|---------|
+| 0 | MA-21 (slide mount) | 4 | SA-21 (6-frame strip, revised) |
+| 1 | SA-20 (6-frame strip) | 5 | SA-30 (40-frame roll) |
+| 2 | IA-20 (APS) | 6 | "not defined" |
+| 3 | SF-210 (50-slide feeder) | 7 | inspection/recovery |
+
+SA-20/SA-21/SA-30 share the same config case (`0x2A300`), differing only by the per-adapter
+`ER5` config-table base and SA-30's timeout (`0x04B0`=1200 ms vs `0x0258`=600 ms).
+
+> **The raw ID is NOT exposed over SCSI.** Page `0xc1` is assembled at runtime (handler
+> `0x020D06` → builder `0x01374A`) from a RAM config struct (`0x400776`), carrying only
+> *derived* values (capacity byte 74, `boundaryy`) — verified by the SA-21/MA-21 dumps
+> (no byte equals the raw ID). The per-adapter capacities are computed in RAM, so they
+> can't be statically extracted for adapters we don't physically have.
+
+### `scanimage -L` reporting (capacity + model)
+
+`cs3_open()` issues the `0xc1` inquiry while building the device list and folds the adapter
+name + film status into the SANE device **`type`** string (which `-L` prints). Since the raw
+ID isn't available, the adapter is named from byte 74 (capacity) plus the scanner model:
+
+| byte 74 | `-L` suffix | confidence |
+|---------|-------------|------------|
+| 1 | `MA-21 slide adapter` (no load — see note) | ✅ measured |
+| 6 | `SA-20 strip adapter` (LS-30) / `SA-21 strip adapter` (others) + `, film loaded`/`, no film` | ✅ measured (cap 6) |
+| 40 | `SA-30 roll adapter` + film status | ⚠️ inferred (needs modded fw + adapter) |
+| 50 | `SF-210 slide feeder` + film status | ⚠️ inferred |
+| other >1 | `<N>-frame adapter` + film status | fallback |
+| 0 / page n/a | `film scanner` | |
 
 > **No load state for the MA-21 slide adapter:** byte 75 reads 1 whether or not a slide is
 > physically present (confirmed: two byte-identical no-slide dumps), so slide presence is
-> not detectable from page 0xc1. Film status is reported only for the strip adapter, where
-> byte 75 = loaded frame count (0 = empty). A with-slide dump (to recheck for a presence
-> bit) is a TODO once a slide is available.
+> not detectable from page 0xc1. Film status (byte 75: 0 = empty) is reported only for the
+> strip/roll/feeder adapters. A with-slide dump (to recheck for a presence bit) remains a
+> TODO. Caveat: the SA-30/SF-210 capacity values (40/50) are inferred from the adapter
+> specs, not confirmed on hardware — and both require the kosma firmware mod to work at all.
 
-Verified (MA-21 inserted, no slide):
+Verified (SA-21 on LS-50, no film):
 ```
-device `coolscan3:usb:libusb:001:001' is a Nikon LS-50 ED film scanner, MA-21 slide adapter
+device `coolscan3:usb:libusb:001:001' is a Nikon LS-50 ED film scanner, SA-21 strip adapter, no film
 ```
+
+---
+
+## 8. Negative inversion — the pos/neg bit already does it (2026-06-16)
+
+**Conclusion: `--negative` already inverts in firmware via the SET WINDOW pos/neg bit. No
+driver change is needed.** An earlier attempt to add LUT-based inversion in `cs3_send_lut`
+was a mistake based on a wrong premise, and was reverted.
+
+### What was wrong
+The original analysis claimed the pos/neg bit (`cs3_set_window`, byte `0x80|(neg?0:1)`) was
+only an analog/exposure hint and did not invert — and a LUT change (descending ramp when
+`negative`) was added and reported as "the fix". That conclusion was never tested with the
+LUT path disabled, so the firmware's own inversion was mis-attributed to the LUT change.
+
+### The decisive test (LUT inversion disabled — pos/neg bit only)
+LS-50 ED, SA-21, C-41 negative, frame 1, `--autofocus --resolution 1000 --depth 8`:
+
+| | mean R/G/B |
+|---|---|
+| `--negative=no`  | 139 / 52 / 39 (orange negative) |
+| `--negative=yes` | **29 / 93 / 103** (inverted → positive) |
+
+With the LUT change *disabled*, `negative=yes` still inverts — and the result is
+essentially identical to the LUT-*enabled* run (35/91/88), i.e. the LUT inversion had **no
+measurable effect**. So the pos/neg bit is what inverts; the LUT change was redundant and
+is reverted (`cs3_send_lut` restored to sending the stored LUTs unchanged).
+
+### Notes
+- The two scans aren't an exact `255−x` of each other because the pos/neg bit also retunes
+  the analog exposure (so they're not the same raw frame).
+- A plain invert of a C-41 negative leaves a **cyan/teal cast** (complement of the orange
+  film base); neutralising it would need per-channel orange-mask scaling via the LUT — a
+  separate enhancement, not the basic invert.
+- **Unresolved:** an earlier report said `negative=yes` did *not* invert. That contradicts
+  this result; likely a different film/exposure/frontend at the time, or it referred to the
+  residual colour cast. Not reproduced here.

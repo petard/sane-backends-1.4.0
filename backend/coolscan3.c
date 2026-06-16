@@ -2119,12 +2119,14 @@ cs3_open(const char *device, cs3_interface_t interface, cs3_t ** sp)
 		{
 			/* Report the mounted adapter and film status via the
 			   device "type" string (shown by `scanimage -L`).  Read
-			   vendor page 0xc1: byte 74 = adapter frame capacity
-			   (1 = MA-21 slide mount, 6 = SA-21 strip, other =
-			   N-frame strip), byte 75 = frames currently loaded.
-			   NOTE: for the MA-21 byte 75 is always 1 and does NOT
-			   reflect slide presence, so no load state is reported
-			   for the slide adapter. */
+			   vendor page 0xc1: byte 74 = adapter frame capacity,
+			   byte 75 = frames currently loaded.  The firmware's raw
+			   3-bit adapter ID is not exposed over SCSI, so the
+			   adapter is named from its capacity plus the scanner
+			   model (a 6-frame strip is the SA-20 on the LS-30 and
+			   the SA-21 on later models).  NOTE: for the slide mount
+			   (capacity 1) byte 75 is always 1 and does NOT reflect
+			   slide presence, so no load state is reported there. */
 			char tbuf[80];
 			int cap = 0, loaded = 0;
 
@@ -2137,13 +2139,27 @@ cs3_open(const char *device, cs3_interface_t interface, cs3_t ** sp)
 				snprintf(tbuf, sizeof(tbuf),
 					 "film scanner, MA-21 slide adapter");
 			else if (cap > 1) {
-				char nm[40];
-				if (cap == 6)
+				char nm[48];
+				switch (cap) {
+				case 6:
 					snprintf(nm, sizeof(nm),
-						 "SA-21 strip adapter");
-				else
+						 "%s strip adapter",
+						 (s->type == CS3_TYPE_LS30) ?
+						 "SA-20" : "SA-21");
+					break;
+				case 40:
 					snprintf(nm, sizeof(nm),
-						 "%d-frame strip adapter", cap);
+						 "SA-30 roll adapter");
+					break;
+				case 50:
+					snprintf(nm, sizeof(nm),
+						 "SF-210 slide feeder");
+					break;
+				default:
+					snprintf(nm, sizeof(nm),
+						 "%d-frame adapter", cap);
+					break;
+				}
 				snprintf(tbuf, sizeof(tbuf), "film scanner, %s, %s",
 					 nm, loaded ? "film loaded" : "no film");
 			} else
